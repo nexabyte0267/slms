@@ -1,0 +1,178 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev}
+      POSTGRES_DB: slms
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d slms"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.23.1
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-dev}
+      DB_NAME: slms
+      AUTH_TYPE: scram-sha-256
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 500
+      DEFAULT_POOL_SIZE: ${PGBOUNCER_POOL_SIZE:-40}
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U postgres -d slms"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  cache:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    image: slms-backend:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    deploy:
+      replicas: 2
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-dev}@pgbouncer:5432/slms?schema=public
+      REDIS_URL: redis://cache:6379
+      PORT: 4000
+    volumes:
+      - uploads:/app/public/uploads
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:4000/api/books',r=>process.exit(r.statusCode < 500 ? 0 : 1)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    image: slms-backend:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["node", "dist/worker.js"]
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-dev}@pgbouncer:5432/slms?schema=public
+      REDIS_URL: redis://cache:6379
+
+  migrate:
+    image: slms-backend:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["npx", "prisma", "migrate", "deploy"]
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-dev}@db:5432/slms?schema=public
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: /api
+    expose:
+      - "80"
+
+  proxy:
+    image: nginx:1.27-alpine
+    entrypoint: ["/bin/sh", "/opt/proxy-entrypoint.sh"]
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/bootstrap.conf:ro
+      - ./nginx/https.conf.template:/etc/nginx/https.conf.template:ro
+      - ./nginx/proxy-entrypoint.sh:/opt/proxy-entrypoint.sh:ro
+      - certbot-etc:/etc/letsencrypt
+      - certbot-webroot:/var/www/certbot
+
+  certbot:
+    image: certbot/certbot:latest
+    entrypoint: ["/bin/sh", "-c"]
+    command: >-
+      if [ ! -f "/etc/letsencrypt/live/$$DOMAIN/fullchain.pem" ]; then
+        until certbot certonly --webroot -w /var/www/certbot --email "$$CERTBOT_EMAIL" --agree-tos --no-eff-email --non-interactive -d "$$DOMAIN"; do sleep 60; done;
+      fi;
+      while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h; done
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+      CERTBOT_EMAIL: ${CERTBOT_EMAIL:-}
+    depends_on:
+      - proxy
+    volumes:
+      - certbot-etc:/etc/letsencrypt
+      - certbot-webroot:/var/www/certbot
+
+  backup:
+    image: postgres:16-alpine
+    entrypoint: ["/bin/sh", "-c"]
+    command: "while :; do sh /scripts/backup.sh; sleep 86400; done"
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-dev}@db:5432/slms
+      BACKUP_DIR: /backups
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./scripts/backup.sh:/scripts/backup.sh:ro
+      - backups:/backups
+
+volumes:
+  pgdata:
+  redisdata:
+  uploads:
+  backups:
+  certbot-etc:
+  certbot-webroot:

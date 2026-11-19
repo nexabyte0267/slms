@@ -1,0 +1,10 @@
+node_modules
+dist
+coverage
+.git
+.env
+frontend/.env
+frontend/node_modules
+frontend/dist
+backups
+public/uploads
